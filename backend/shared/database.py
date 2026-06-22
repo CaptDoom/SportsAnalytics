@@ -1,13 +1,14 @@
-import os
 from typing import Generator
 from sqlmodel import SQLModel, create_engine, Session
 from sqlalchemy.orm import sessionmaker
+from shared.config import settings
 
-# Load DATABASE_URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/badminton")
+# Load DATABASE_URL from centralized settings
+DATABASE_URL = settings.DATABASE_URL
 
 # SQLite fallback for testing
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
+
 
 # Create SQLAlchemy engine
 if IS_SQLITE:
