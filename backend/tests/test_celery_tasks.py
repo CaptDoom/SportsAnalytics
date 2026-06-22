@@ -74,3 +74,85 @@ def test_process_match_cv_stage1_sync(mock_stage2_delay, db_session: Session):
     
     # Assert Stage 2 task was queued via .delay
     mock_stage2_delay.assert_called_once_with(str(match.match_id))
+
+def test_process_match_cv_stage2_sync(db_session: Session):
+    # 1. Setup seed data with trajectories and player positions
+    player_a = Player(name="Viktor Axelsen", country="Denmark")
+    player_b = Player(name="Lee Zii Jia", country="Malaysia")
+    db_session.add(player_a)
+    db_session.add(player_b)
+    db_session.commit()
+    db_session.refresh(player_a)
+    db_session.refresh(player_b)
+
+    match = Match(
+        player_a_id=player_a.player_id,
+        player_b_id=player_b.player_id,
+        tournament="Thomas Cup",
+        source_type="broadcast",
+        processing_status="processing_cv",
+        fps=30.0
+    )
+    db_session.add(match)
+    db_session.commit()
+    db_session.refresh(match)
+
+    # Add trajectories (active segment 10-60, gap, active segment 140-190)
+    for f in range(1, 201):
+        visible = (10 <= f <= 60) or (140 <= f <= 190)
+        traj = ShuttleTrajectory(
+            match_id=match.match_id,
+            frame_number=f,
+            pixel_x=100.0,
+            pixel_y=200.0,
+            court_x=0.5,
+            court_y=0.5,
+            visible=visible
+        )
+        db_session.add(traj)
+        
+        # Add positions
+        pos_a = PlayerPosition(
+            match_id=match.match_id,
+            frame_number=f,
+            player_id=player_a.player_id,
+            court_x=0.5,
+            court_y=0.25,
+            pose_keypoints={"x_min": 100, "y_min": 100, "x_max": 200, "y_max": 300}
+        )
+        pos_b = PlayerPosition(
+            match_id=match.match_id,
+            frame_number=f,
+            player_id=player_b.player_id,
+            court_x=0.5,
+            court_y=0.75,
+            pose_keypoints={"x_min": 100, "y_min": 500, "x_max": 200, "y_max": 700}
+        )
+
+        db_session.add(pos_a)
+        db_session.add(pos_b)
+
+    db_session.commit()
+
+    # 2. Run Stage 2 task synchronously
+    with patch("celery.app.task.Task.retry", side_effect=Exception("celery_retry")):
+        result = process_match_cv_stage2(str(match.match_id))
+
+    assert result is True
+
+    # 3. Verify status changes and DB inserts
+    db_session.refresh(match)
+    assert match.processing_status == "done"
+
+    # Verify Rallies segmented (should be 2 rallies due to gap of 20 frames)
+    from shared.models import Rally, Shot
+    rallies = db_session.query(Rally).all()
+    assert len(rallies) == 2
+    assert rallies[0].rally_number == 1
+    assert rallies[1].rally_number == 2
+
+    # Verify Shots created
+    shots = db_session.query(Shot).all()
+    assert len(shots) > 0
+    assert shots[0].shot_type in ["short serve", "long/flick serve"]
+
