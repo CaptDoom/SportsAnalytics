@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     
     FORCE_CPU: bool = os.getenv("FORCE_CPU", "false").lower() == "true"
     VRAM_LIMIT_MB: int = int(os.getenv("VRAM_LIMIT_MB", "3500"))
+    
+    TRACKNET_WEIGHTS_PATH: str = os.getenv("TRACKNET_WEIGHTS_PATH", "backend/cv_worker/vendor/tracknetv3/weights/model.onnx")
+    YOLO_WEIGHTS_PATH: str = os.getenv("YOLO_WEIGHTS_PATH", "yolov8n.onnx")
+    BST_WEIGHTS_PATH: str = os.getenv("BST_WEIGHTS_PATH", "backend/cv_worker/vendor/bst/weights/bst.onnx")
+
 
     class Config:
         env_file = ".env"
