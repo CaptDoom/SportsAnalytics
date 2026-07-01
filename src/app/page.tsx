@@ -85,6 +85,7 @@ export default function Dashboard() {
 
     // Canvas overlay drawing loop
     useEffect(() => {
+        let rVFCId: number;
         let animId: number;
         
         const projectCourtToCanvas = (courtX: number, courtY: number, video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
@@ -98,7 +99,37 @@ export default function Dashboard() {
             };
         };
 
-        const drawOverlay = () => {
+        const detectImpacts = (trajs: any[]) => {
+            const impacts: { x: number; y: number; frame: number; isOut: boolean }[] = [];
+            if (trajs.length < 3) return impacts;
+            
+            for (let i = 1; i < trajs.length - 1; i++) {
+                const prev = trajs[i - 1];
+                const curr = trajs[i];
+                const next = trajs[i + 1];
+                
+                if (prev.pixel_y && curr.pixel_y && next.pixel_y && prev.visible && curr.visible && next.visible) {
+                    const isLocalMaxY = curr.pixel_y > prev.pixel_y && curr.pixel_y > next.pixel_y;
+                    const dy1 = curr.pixel_y - prev.pixel_y;
+                    const dy2 = next.pixel_y - curr.pixel_y;
+                    const isAbruptFlip = dy1 * dy2 < -5;
+                    const isLabeledEvent = curr.event !== null && curr.event !== undefined && curr.event !== "rally" && curr.event !== "";
+                    
+                    if ((isLocalMaxY && isAbruptFlip) || isLabeledEvent) {
+                        const inBounds = curr.court_x >= 0.05 && curr.court_x <= 0.95 && curr.court_y >= 0.05 && curr.court_y <= 0.95;
+                        impacts.push({
+                            x: curr.pixel_x,
+                            y: curr.pixel_y,
+                            frame: curr.frame_number,
+                            isOut: !inBounds
+                        });
+                    }
+                }
+            }
+            return impacts;
+        };
+
+        const drawOverlay = (timeSec?: number) => {
             const video = videoRef.current;
             const canvas = canvasRef.current;
             if (!video || !canvas) return;
@@ -114,7 +145,8 @@ export default function Dashboard() {
             
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            const currentFrame = Math.round(video.currentTime * (selectedMatch?.fps || 30.0));
+            const mediaTime = timeSec !== undefined ? timeSec : video.currentTime;
+            const currentFrame = Math.round(mediaTime * (selectedMatch?.fps || 30.0));
 
             // 1. Draw speed trail (if showSpeedTrail)
             if (showSpeedTrail && trajectories.length > 0) {
@@ -123,9 +155,9 @@ export default function Dashboard() {
                 let first = true;
                 for (let f = startFrame; f <= currentFrame; f++) {
                     const pt = trajectories.find(t => t.frame_number === f);
-                    if (pt && pt.x !== null && pt.y !== null && pt.x !== 0.0 && pt.y !== 0.0) {
-                        const canvasX = (pt.x / video.videoWidth) * canvas.width;
-                        const canvasY = (pt.y / video.videoHeight) * canvas.height;
+                    if (pt && pt.pixel_x !== null && pt.pixel_y !== null && pt.pixel_x !== 0.0 && pt.pixel_y !== 0.0) {
+                        const canvasX = (pt.pixel_x / video.videoWidth) * canvas.width;
+                        const canvasY = (pt.pixel_y / video.videoHeight) * canvas.height;
                         if (first) {
                             ctx.moveTo(canvasX, canvasY);
                             first = false;
@@ -138,6 +170,65 @@ export default function Dashboard() {
                 ctx.lineWidth = 3;
                 ctx.stroke();
             }
+
+            // Draw pulsing neon circle centered precisely over the ball/shuttlecock's (x,y) coordinates
+            const shPt = trajectories.find(t => t.frame_number === currentFrame);
+            if (shPt && shPt.pixel_x !== null && shPt.pixel_y !== null && shPt.pixel_x > 0) {
+                const canvasX = (shPt.pixel_x / video.videoWidth) * canvas.width;
+                const canvasY = (shPt.pixel_y / video.videoHeight) * canvas.height;
+                
+                const pulsePeriod = 500;
+                const nowTime = Date.now();
+                const scale = 1 + 0.3 * Math.sin((nowTime % pulsePeriod) / pulsePeriod * 2 * Math.PI);
+                const radius = 8 * scale;
+                
+                ctx.beginPath();
+                ctx.arc(canvasX, canvasY, radius, 0, 2 * Math.PI);
+                ctx.fillStyle = "rgba(56, 189, 248, 0.4)";
+                ctx.fill();
+                
+                ctx.beginPath();
+                ctx.arc(canvasX, canvasY, 4, 0, 2 * Math.PI);
+                ctx.fillStyle = "#38bdf8";
+                ctx.fill();
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                
+                if (shPt.speed) {
+                    ctx.fillStyle = "#38bdf8";
+                    ctx.font = "bold 10px monospace";
+                    ctx.textAlign = "left";
+                    ctx.fillText(`${shPt.speed.toFixed(1)} km/h`, canvasX + 12, canvasY - 4);
+                }
+            }
+
+            // Draw Persistent Glowing Markers for Bounces/Impacts
+            const impacts = detectImpacts(trajectories);
+            impacts.forEach(imp => {
+                if (currentFrame >= imp.frame) {
+                    const canvasX = (imp.x / video.videoWidth) * canvas.width;
+                    const canvasY = (imp.y / video.videoHeight) * canvas.height;
+                    
+                    ctx.beginPath();
+                    ctx.arc(canvasX, canvasY, 12, 0, 2 * Math.PI);
+                    ctx.fillStyle = imp.isOut ? "rgba(239, 68, 68, 0.25)" : "rgba(16, 185, 129, 0.25)";
+                    ctx.fill();
+                    
+                    ctx.beginPath();
+                    ctx.arc(canvasX, canvasY, 5, 0, 2 * Math.PI);
+                    ctx.fillStyle = imp.isOut ? "#ef4444" : "#10b981";
+                    ctx.fill();
+                    ctx.strokeStyle = "#ffffff";
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+                    
+                    ctx.fillStyle = "#ffffff";
+                    ctx.font = "bold 8px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.fillText(imp.isOut ? "OUT" : "IN", canvasX, canvasY - 8);
+                }
+            });
 
             // 2. Draw Minimalist Skeletal Overlay (if showSkeleton)
             if (showSkeleton && playerPositions && playerPositions.length > 0) {
@@ -245,10 +336,10 @@ export default function Dashboard() {
                     }
                 });
                 
-                const shPt = trajectories.find(t => t.frame_number === currentFrame);
-                if (shPt && shPt.court_x !== null && shPt.court_y !== null) {
-                    const shX = mapX + shPt.court_x * mapW;
-                    const shY = mapY + shPt.court_y * mapH;
+                const shPtMini = trajectories.find(t => t.frame_number === currentFrame);
+                if (shPtMini && shPtMini.court_x !== null && shPtMini.court_y !== null) {
+                    const shX = mapX + shPtMini.court_x * mapW;
+                    const shY = mapY + shPtMini.court_y * mapH;
                     ctx.beginPath();
                     ctx.arc(shX, shY, 3, 0, 2 * Math.PI);
                     ctx.fillStyle = "#eab308";
@@ -257,13 +348,36 @@ export default function Dashboard() {
             }
         };
 
-        const loop = () => {
-            drawOverlay();
-            animId = requestAnimationFrame(loop);
+        const updateFrame = (now: number, metadata: any) => {
+            drawOverlay(metadata.mediaTime);
+            if (videoRef.current && 'requestVideoFrameCallback' in videoRef.current) {
+                // @ts-ignore
+                rVFCId = videoRef.current.requestVideoFrameCallback(updateFrame);
+            }
         };
+
+        if (videoRef.current && 'requestVideoFrameCallback' in videoRef.current) {
+            // @ts-ignore
+            rVFCId = videoRef.current.requestVideoFrameCallback(updateFrame);
+        } else {
+            const loop = () => {
+                if (videoRef.current) {
+                    drawOverlay(videoRef.current.currentTime);
+                }
+                animId = requestAnimationFrame(loop);
+            };
+            animId = requestAnimationFrame(loop);
+        }
         
-        animId = requestAnimationFrame(loop);
-        return () => cancelAnimationFrame(animId);
+        return () => {
+            if (videoRef.current && 'requestVideoFrameCallback' in videoRef.current && rVFCId) {
+                // @ts-ignore
+                videoRef.current.cancelVideoFrameCallback(rVFCId);
+            }
+            if (animId) {
+                cancelAnimationFrame(animId);
+            }
+        };
     }, [trajectories, playerPositions, showSkeleton, showSpeedTrail, showMiniMap, selectedMatch]);
 
     const handleSeek = (ms: number) => {

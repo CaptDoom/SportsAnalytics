@@ -24,6 +24,7 @@ from typing import List, Tuple, Dict, Any, Generator, Optional
 from sqlmodel import Session, select, delete
 from sqlalchemy import func
 from scipy.stats import gaussian_kde
+from scipy.interpolate import CubicSpline
 from ultralytics import YOLO
 
 from src.pipeline.database import engine
@@ -229,21 +230,48 @@ class PhysicsInformedEKF:
         az = -(self.g + self.Cd * v * vz)
         return float(ax), float(ay), float(az)
 
-# ----------------- Trajectory Moving Average -----------------
+# ----------------- Trajectory Cubic Spline Smoothing -----------------
 def smooth_trajectory_points(points_data: List[Dict[str, Any]], window_size: int = 5):
     n = len(points_data)
-    if n < window_size:
-        return
-    for i in range(n):
-        if points_data[i]["pt"].visibility:
-            half = window_size // 2
-            neighbors = []
-            for j in range(max(0, i - half), min(n, i + half + 1)):
-                if points_data[j]["pt"].visibility and points_data[j]["pt"].x > 0:
-                    neighbors.append(points_data[j])
-            if neighbors:
-                points_data[i]["pt"].x = sum(p["pt"].x for p in neighbors) / len(neighbors)
-                points_data[i]["pt"].y = sum(p["pt"].y for p in neighbors) / len(neighbors)
+    visible_indices = [i for i in range(n) if points_data[i]["pt"].visibility]
+    
+    if len(visible_indices) >= 4:
+        t = np.array(visible_indices, dtype=np.float32)
+        x_vals = np.array([points_data[i]["pt"].x for i in visible_indices], dtype=np.float32)
+        y_vals = np.array([points_data[i]["pt"].y for i in visible_indices], dtype=np.float32)
+        
+        try:
+            cs_x = CubicSpline(t, x_vals, bc_type='natural')
+            cs_y = CubicSpline(t, y_vals, bc_type='natural')
+            
+            for idx in visible_indices:
+                points_data[idx]["pt"].x = float(cs_x(idx))
+                points_data[idx]["pt"].y = float(cs_y(idx))
+        except Exception as e:
+            print(f"[Processor Warning] Cubic Spline fitting failed: {e}. Falling back to moving average.")
+            # Fallback to moving average if spline fails
+            for i in range(n):
+                if points_data[i]["pt"].visibility:
+                    half = window_size // 2
+                    neighbors = []
+                    for j in range(max(0, i - half), min(n, i + half + 1)):
+                        if points_data[j]["pt"].visibility and points_data[j]["pt"].x > 0:
+                            neighbors.append(points_data[j])
+                    if neighbors:
+                        points_data[i]["pt"].x = sum(p["pt"].x for p in neighbors) / len(neighbors)
+                        points_data[i]["pt"].y = sum(p["pt"].y for p in neighbors) / len(neighbors)
+    else:
+        # Fallback to moving average if too few points
+        for i in range(n):
+            if points_data[i]["pt"].visibility:
+                half = window_size // 2
+                neighbors = []
+                for j in range(max(0, i - half), min(n, i + half + 1)):
+                    if points_data[j]["pt"].visibility and points_data[j]["pt"].x > 0:
+                        neighbors.append(points_data[j])
+                if neighbors:
+                    points_data[i]["pt"].x = sum(p["pt"].x for p in neighbors) / len(neighbors)
+                    points_data[i]["pt"].y = sum(p["pt"].y for p in neighbors) / len(neighbors)
 
 # ----------------- 2. Joint low-pass EMA filter -----------------
 class JointFilter:
@@ -398,6 +426,39 @@ class ShuttleTracker:
         self.prev_frame = None
         self.preprev_frame = None
 
+    def sahi_detect_ball(self, frame: np.ndarray, model) -> Tuple[Optional[float], Optional[float], float]:
+        """
+        Implements Slicing Aided Hyper Inference (SAHI) for YOLO ball detection.
+        Slices the frame into overlapping patches, runs model detection,
+        and translates coordinates back to full image space.
+        """
+        height, width = frame.shape[:2]
+        slice_h, slice_w = 320, 320
+        overlap = 64
+        
+        best_x, best_y = None, None
+        best_conf = 0.0
+        
+        y_starts = [0, height - slice_h] if height > slice_h else [0]
+        x_starts = [0, width - slice_w] if width > slice_w else [0]
+        
+        for y_start in y_starts:
+            for x_start in x_starts:
+                slice_img = frame[y_start:y_start+slice_h, x_start:x_start+slice_w]
+                results = model(slice_img, verbose=False)
+                if len(results) > 0 and results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        cls = int(box.cls[0].item())
+                        conf = float(box.conf[0].item())
+                        if cls == 32 and conf > best_conf:
+                            coords = box.xyxy[0].tolist()
+                            bx = x_start + (coords[0] + coords[2]) / 2.0
+                            by = y_start + (coords[1] + coords[3]) / 2.0
+                            best_x, best_y = bx, by
+                            best_conf = conf
+                            
+        return best_x, best_y, best_conf
+
     def track_shuttle_frame(self, frame: np.ndarray, frame_number: int, prev_points: List[ShuttlePoint], h_matrix: np.ndarray, use_simulator: bool = False) -> ShuttlePoint:
         height, width = frame.shape[:2]
         detected_x, detected_y = None, None
@@ -434,20 +495,14 @@ class ShuttleTracker:
                     detected_y = y_pred * (height / input_height)
                     confidence = 0.90
 
-        # C. YOLO fallback
+        # C. YOLO fallback with SAHI
         if (detected_x is None or detected_y is None) and self.yolo_model is not None:
             try:
-                results = self.yolo_model(frame, verbose=False)
-                if len(results) > 0 and results[0].boxes is not None:
-                    for box in results[0].boxes:
-                        cls = int(box.cls[0].item())
-                        conf = float(box.conf[0].item())
-                        if cls == 32 and conf > 0.30:
-                            coords = box.xyxy[0].tolist()
-                            detected_x = (coords[0] + coords[2]) / 2.0
-                            detected_y = (coords[1] + coords[3]) / 2.0
-                            confidence = conf
-                            break
+                bx, by, conf = self.sahi_detect_ball(frame, self.yolo_model)
+                if bx is not None and conf > 0.30:
+                    detected_x = bx
+                    detected_y = by
+                    confidence = conf
             except Exception:
                 pass
 
